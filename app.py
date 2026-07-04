@@ -1,137 +1,122 @@
-from flask import Flask, Markup, request, render_template, redirect, url_for, flash
-import requests
-import json 
-import time
-import math
+import re
+from flask import Flask, request, render_template, redirect, url_for, flash
 import datetime
-import creds
 from collections import Counter
+from typing import List, Dict, Any, Optional
+
+from config import Config
+from providers import get_provider
 
 app = Flask(__name__)
-app.secret_key = creds.ACCESS_TOKEN
+app.secret_key = Config.SECRET_KEY
 
 @app.route('/')
 def home():
-	return render_template('index.html')
+    return render_template('index.html')
 
 @app.route('/u/<user_input>', methods=['GET'])
-def get_data(user_input):
-	# Username -> id
-	user = requests.get("https://api.instagram.com/v1/users/search?q=%s&access_token=%s" % (user_input, creds.ACCESS_TOKEN))
+def get_data(user_input: str):
+    # Sanitize and validate username input
+    if not re.match(r'^[a-zA-Z0-9._]+$', user_input):
+        flash("Invalid username format. Usernames can only contain letters, numbers, periods, and underscores.")
+        return redirect(url_for("home"))
 
-	if not (user.json()['data']):
-		flash("Error loading profile. Make sure profile is public and exists.")		
-		return redirect(url_for("home"))
-	else:
-		user_id = closest_match(user.json()['data'], user_input)
+    provider = get_provider()
 
-	if not user_id:
-		flash("Error loading profile. Make sure profile is public and exists.")		
-		return redirect(url_for("home"))
+    # Fetch user search results
+    users = provider.search_users(user_input)
+    if not users:
+        flash("Error loading profile. Make sure profile is public and exists.")
+        return redirect(url_for("home"))
 
+    user_id = closest_match(users, user_input)
+    if not user_id:
+        flash("Error loading profile. Make sure profile is public and exists.")
+        return redirect(url_for("home"))
 
-	# Make request for user info
+    user_info = provider.get_user_info(user_id)
+    if user_info is None:
+        flash("Error loading profile. Make sure profile is public and exists.")
+        return redirect(url_for("home"))
 
-	user_request = requests.get("https://api.instagram.com/v1/users/%s/?access_token=%s" % (user_id, creds.ACCESS_TOKEN))
-	
-	if user_request.json()['meta']['code'] == 400:
-		flash("Error loading profile. Make sure profile is public and exists.")		
-		return redirect(url_for("home"))
+    media_data = provider.get_recent_media(user_id)
+    if not media_data:
+        flash("Error. User has no media.")
+        return redirect(url_for("home"))
 
-	# Get user info as dict, used to populate
-	user_info = user_request.json()['data']
+    processed_data = process_media_data(media_data)
 
-	# Get media data for last 20 posts
-	if user_request.json()['data']['counts']['media'] == 0:
-		flash("Error. User has no media.")		
-		return redirect(url_for("home"))
+    all_data = {
+        'basic': user_info,
+        'likes': list(reversed(processed_data['likes'])),
+        'comments': list(reversed(processed_data['comments'])),
+        'days': processed_data['days_pos'],
+        'hours': processed_data['hours_pos'],
+        'filters': processed_data['filters_arr'],
+        'locations': processed_data['locations'],
+        'tags': set(processed_data['tags']),
+        'tag_positions': processed_data['tag_positions'],
+        'date_range': processed_data['date_range'],
+    }
 
-	media_request = requests.get("https://api.instagram.com/v1/users/%s/media/recent/?access_token=%s&count=33" % (user_id, creds.ACCESS_TOKEN))
+    return render_template('chart.html', all_data=all_data)
 
-	# return json.dumps(media_request.json()['data'])
+def closest_match(data: List[Dict[str, Any]], match: str) -> Optional[str]:
+    """Finds the closest matching username in data."""
+    for user in data:
+        if user['username'].lower() == match.lower():
+            return user['id']
+    return None
 
-	likes = []
-	comments = []
-	days = []
-	hours = []
-	filters = []
-	locations = []
-	tags = []
-	tag_positions = []
-	date_range = []
+def process_media_data(media_data: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Process media data to extract useful information."""
+    likes, comments, days, hours, filters, locations, tags, tag_positions = [], [], [], [], [], [], [], []
+    date_range = []
 
-	# Add date range
-	date_range.append(datetime.datetime.fromtimestamp(int(media_request.json()['data'][0]['created_time'])).strftime('%b %e/%y'))
-	date_range.append(datetime.datetime.fromtimestamp(int(media_request.json()['data'][len(media_request.json()['data'])-1]['created_time'])).strftime('%b %e/%y'))
+    if media_data:
+        date_range.append(format_timestamp(media_data[0]['created_time']))
+        date_range.append(format_timestamp(media_data[-1]['created_time']))
 
-	print len(media_request.json()['data'])
-	# Loop and get relevant data
-	for i in range(0, len(media_request.json()['data'])):
-		try:
-			likes.append(media_request.json()['data'][i]['likes']['count'])
-			comments.append(media_request.json()['data'][i]['comments']['count'])
-			days.append(datetime.datetime.fromtimestamp(int(media_request.json()['data'][i]['created_time'])).strftime('%a'))
-			hours.append(datetime.datetime.fromtimestamp(int(media_request.json()['data'][i]['created_time'])).strftime('%H'))
-			filters.append(media_request.json()['data'][i]['filter'])
-			locations.append([media_request.json()['data'][i]['location']['latitude'], media_request.json()['data'][i]['location']['longitude']])		
-			
-			for x in range(0, len(media_request.json()['data'][i]['users_in_photo'])):
-				tags.append(media_request.json()['data'][i]['users_in_photo'][x]['user']['username'])
-				tag_positions.append([media_request.json()['data'][i]['users_in_photo'][x]['position']['x'], media_request.json()['data'][i]['users_in_photo'][x]['position']['y']])
-		
-		except (KeyError, TypeError, IndexError) as e:
-			pass
+    for post in media_data:
+        try:
+            likes.append(post['likes']['count'])
+            comments.append(post['comments']['count'])
+            days.append(format_timestamp(post['created_time'], '%a'))
+            hours.append(format_timestamp(post['created_time'], '%H'))
+            filters.append(post.get('filter', 'Unknown'))
+            if 'location' in post and post['location']:
+                locations.append([post['location']['latitude'], post['location']['longitude']])
+            for user_tag in post.get('users_in_photo', []):
+                tags.append(user_tag['user']['username'])
+                tag_positions.append([user_tag['position']['x'], user_tag['position']['y']])
+        except (KeyError, TypeError, IndexError):
+            continue
 
+    days_pos = count_occurrences(days, ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"])
+    hours_pos = count_occurrences(hours, [f"{i:02}" for i in range(24)])
+    filters_arr = [[filter_, count] for filter_, count in Counter(filters).items()]
 
-	# AMATEUR HOUR AHEAD
+    return {
+        'likes': likes,
+        'comments': comments,
+        'days_pos': days_pos,
+        'hours_pos': hours_pos,
+        'filters_arr': filters_arr,
+        'locations': locations,
+        'tags': tags,
+        'tag_positions': tag_positions,
+        'date_range': date_range
+    }
 
-	days_pos = [["Mon", 0],["Tue", 0],["Wed", 0],["Thu", 0],["Fri", 0],["Sat", 0],["Sun", 0]]
+def format_timestamp(timestamp: str, fmt: str = '%b %e/%y') -> str:
+    """Convert timestamp to formatted string."""
+    return datetime.datetime.fromtimestamp(int(timestamp)).strftime(fmt)
 
-	for i in range(0, len(days)):
-		for j in range(0, len(days_pos)):
-			if days[i] in days_pos[j][0]:
-				days_pos[j][1] = days_pos[j][1] + 1
-
-
-	hours_pos = [["00",0],["01",0],["02",0],["03",0],["04",0],["05",0],["06",0],["07",0],["08",0],["09",0],["10",0],["11",0],["12",0],["13",0],["14",0],["15",0],["16",0],["17",0],["18",0],["19",0],["20",0],["21",0],["22",0],["23",0]]
-
-	for i in range(0, len(hours)):
-		for j in range(0, len(hours_pos)):
-			if hours[i] in hours_pos[j][0]:
-				hours_pos[j][1] = hours_pos[j][1] + 1
-
-
-	filters_arr = []
-
-	for key, value in dict(Counter(filters)).iteritems():
-		temp = [str(key),value]
-		filters_arr.append(temp)
-
-	all_data = {}
-	all_data['basic'] = user_info
-	all_data['likes'] = list(reversed(likes)) 
-	all_data['comments'] = list(reversed(comments))
-	all_data['days'] = days_pos
-	all_data['hours'] = hours_pos
-	all_data['filters'] = filters_arr
-	all_data['locations'] = locations
-	all_data['tags'] = set(tags)
-	all_data['tag_positions'] = tag_positions
-	all_data['date_range'] = date_range
-
-	return render_template('chart.html', all_data=all_data)
-
-def closest_match(obj, match):
-
-	res = None
-
-	for i in range(0,len(obj)):
-		if obj[i]['username'] == match.lower():
-			res = obj[i]['id']
-			break
-
-	return res
+def count_occurrences(items: List[str], categories: List[str]) -> List[List[str]]:
+    """Count occurrences of items and map them to predefined categories."""
+    counts = Counter(items)
+    return [[category, counts.get(category, 0)] for category in categories]
 
 if __name__ == "__main__":
-    app.debug = True
-    app.run(host='0.0.0.0', port=5001)
+    app.debug = Config.DEBUG
+    app.run(host='0.0.0.0', port=Config.PORT)
